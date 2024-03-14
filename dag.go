@@ -1,59 +1,139 @@
 package merkledag
 
 import (
-	"fmt"
+	"encoding/json"
+	"errors"
 	"hash"
 )
 
-func Add(store KVStore, node Node, h hash.Hash) ([]byte, error) {
-	// 根据节点类型进行不同的处理
-	switch n := node.(type) {
-	case File:
-		// 对于文件，我们直接将其字节内容哈希并存储
-		h.Write(n.Bytes())
-		hashed := h.Sum(nil)
-		err := store.Put(hashed, n.Bytes())
-		if err != nil {
-			return nil, err
-		}
-		return hashed, nil
-	case Dir:
-		// 对于目录，我们递归地添加每个子节点，然后哈希它们的哈希并存储
-		it := n.It()
-		var hashes [][]byte
-		for it.Next() {
-			hashed, err := Add(store, it.Node(), h)
-			if err != nil {
-				return nil, err
-			}
-			hashes = append(hashes, hashed)
-		}
-		// 将所有子哈希连接并哈希
-		for _, hashed := range hashes {
-			h.Write(hashed)
-		}
-		hashed := h.Sum(nil)
-		// 我们需要将子哈希列表存储为目录节点的值
-		err := store.Put(hashed, flatten(hashes))
-		if err != nil {
-			return nil, err
-		}
-		return hashed, nil
-	default:
-		return nil, fmt.Errorf("unknown node type")
-	}
+type Link struct {
+	Name string
+	Hash []byte
+	Size int
 }
 
-// flatten 将一系列字节切片连接成一个单一的字节切片
-func flatten(slices [][]byte) []byte {
-	var totalLen int
-	for _, s := range slices {
-		totalLen += len(s)
+type Object struct {
+	Links []Link
+	Data  []byte
+}
+
+func Add(store KVStore, node Node, h hash.Hash) ([]byte, error) {
+	var obj *Object
+	var err error
+	switch node.Type() {
+	case FILE:
+		file, _ := node.(File)
+		obj, err = addFileToStore(file, store, h)
+	case DIR:
+		dir, _ := node.(Dir)
+		obj, err = addDirToStore(dir, store, h)
+	default:
+		err = errors.New("invalid node type")
 	}
-	ret := make([]byte, totalLen)
-	var offset int
-	for _, s := range slices {
-		offset += copy(ret[offset:], s)
+	if err != nil {
+		return nil, err
 	}
-	return ret
+	return generateMerkleRoot(obj, h), nil
+}
+
+func addFileToStore(file File, store KVStore, h hash.Hash) (*Object, error) {
+	obj, err := sliceFile(file, store, h)
+	if err != nil {
+		return nil, err
+	}
+	err = marshalAndPut(store, obj, h)
+	return obj, err
+}
+
+func addDirToStore(dir Dir, store KVStore, h hash.Hash) (*Object, error) {
+	obj, err := sliceDir(dir, store, h)
+	if err != nil {
+		return nil, err
+	}
+	err = marshalAndPut(store, obj, h)
+	return obj, err
+}
+
+func generateMerkleRoot(obj *Object, h hash.Hash) []byte {
+	jsonMarshal, _ := json.Marshal(obj)
+	h.Write(jsonMarshal)
+	return h.Sum(nil)
+}
+
+func marshalAndPut(store KVStore, obj *Object, h hash.Hash) error {
+	jsonMarshal, _ := json.Marshal(obj)
+	h.Reset()
+	h.Write(jsonMarshal)
+	if has, _ := store.Has(h.Sum(nil)); !has {
+		store.Put(h.Sum(nil), jsonMarshal)
+	}
+	return nil
+}
+
+func sliceFile(file File, store KVStore, h hash.Hash) (*Object, error) {
+	obj := &Object{}
+	if len(file.Bytes()) <= 256*1024 {
+		obj.Data = file.Bytes()
+	} else {
+		err := sliceAndPut(file.Bytes(), store, h, obj, 0)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return obj, nil
+}
+
+func sliceAndPut(data []byte, store KVStore, h hash.Hash, obj *Object, seedId int) error {
+	for seedId < len(data) {
+		end := seedId + 256*1024
+		if end > len(data) {
+			end = len(data)
+		}
+		chunkData := data[seedId:end]
+		blob := Object{
+			Links: nil,
+			Data:  chunkData,
+		}
+		err := marshalAndPut(store, &blob, h)
+		if err != nil {
+			return err
+		}
+		obj.Links = append(obj.Links, Link{
+			Hash: h.Sum(nil),
+			Size: len(chunkData),
+		})
+		obj.Data = append(obj.Data, []byte("blob")...)
+		seedId += 256 * 1024
+	}
+	return nil
+}
+
+func sliceDir(dir Dir, store KVStore, h hash.Hash) (*Object, error) {
+	treeObject := &Object{}
+	iter := dir.It()
+	for iter.Next() {
+		node := iter.Node()
+		var obj *Object
+		var err error
+		switch node.Type() {
+		case FILE:
+			file := node.(File)
+			obj, err = sliceFile(file, store, h)
+			treeObject.Data = append(treeObject.Data, []byte("link")...)
+		case DIR:
+			subDir := node.(Dir)
+			obj, err = sliceDir(subDir, store, h)
+			treeObject.Data = append(treeObject.Data, []byte("tree")...)
+		}
+		if err != nil {
+			return nil, err
+		}
+		treeObject.Links = append(treeObject.Links, Link{
+			Hash: generateMerkleRoot(obj, h),
+			Name: node.Name(),
+			Size: int(node.Size()),
+		})
+	}
+	err := marshalAndPut(store, treeObject, h)
+	return treeObject, err
 }
